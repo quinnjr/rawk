@@ -20,9 +20,10 @@ fn run_awk_rs(args: &[&str], input: Option<&str>) -> Result<String, String> {
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
 
-    if let Some(input_str) = input
-        && let Some(mut stdin) = child.stdin.take()
-    {
+    // Only acquire (and thereby close) the child's stdin when we have input to
+    // send, preserving the original behavior. Written without a `let`-chain so it
+    // compiles on the MSRV (let-chains were stabilized in Rust 1.88).
+    if let Some((input_str, mut stdin)) = input.zip(child.stdin.take()) {
         stdin
             .write_all(input_str.as_bytes())
             .map_err(|e| e.to_string())?;

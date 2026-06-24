@@ -122,7 +122,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85.0"  # Rust 2024 edition minimum
+          toolchain: "1.86.0"  # MSRV: edition 2024 needs 1.85, criterion 0.8 (dev-dep) needs 1.86
 
       - name: Build
         run: cargo build --verbose
