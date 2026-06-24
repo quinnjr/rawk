@@ -53,6 +53,9 @@ jobs:
   outdated:
     name: Outdated Dependencies
     runs-on: ubuntu-latest
+    # Informational only: `cargo outdated --exit-code 0` never fails on outdated
+    # crates, and a transient `cargo install` network error should not block PRs.
+    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6

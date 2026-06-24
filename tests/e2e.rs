@@ -57,6 +57,19 @@ fn run_awk_with_fs(program: &str, input: &str, fs: &str) -> Result<String, Strin
     String::from_utf8(output).map_err(|e| e.to_string())
 }
 
+/// The platform's null device path, usable as an AWK string literal target.
+/// `NUL` on Windows, `/dev/null` elsewhere.
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
+/// Return a unique temp file path (inside the OS temp dir) with forward slashes,
+/// so it can be safely embedded in an AWK string literal on all platforms.
+fn temp_file_path(name: &str) -> String {
+    let path = std::env::temp_dir().join(name);
+    path.to_string_lossy().replace('\\', "/")
+}
+
 // ============================================================================
 // Basic Output Tests
 // ============================================================================
@@ -1064,14 +1077,20 @@ fn test_argc_zero() {
 fn test_print_redirect_parsing() {
     // Verify that print "hello" > "file" parses correctly
     // (doesn't treat > as comparison)
-    let result = run_awk(r#"BEGIN { print "test" > "/dev/null" }"#, "");
+    let result = run_awk(
+        &format!(r#"BEGIN {{ print "test" > "{}" }}"#, null_device()),
+        "",
+    );
     assert!(result.is_ok(), "print with > redirection should parse");
 }
 
 #[test]
 fn test_print_append_parsing() {
     // Verify that print "hello" >> "file" parses correctly
-    let result = run_awk(r#"BEGIN { print "test" >> "/dev/null" }"#, "");
+    let result = run_awk(
+        &format!(r#"BEGIN {{ print "test" >> "{}" }}"#, null_device()),
+        "",
+    );
     assert!(result.is_ok(), "print with >> append should parse");
 }
 
@@ -1085,7 +1104,10 @@ fn test_print_pipe_parsing() {
 #[test]
 fn test_printf_redirect_parsing() {
     // Verify printf with redirection parses
-    let result = run_awk(r#"BEGIN { printf "%s\n", "test" > "/dev/null" }"#, "");
+    let result = run_awk(
+        &format!(r#"BEGIN {{ printf "%s\n", "test" > "{}" }}"#, null_device()),
+        "",
+    );
     assert!(result.is_ok(), "printf with > redirection should parse");
 }
 
@@ -1735,14 +1757,22 @@ fn test_exit_with_code() {
 #[test]
 fn test_print_redirect_truncate() {
     // print to file (truncate mode)
-    let output = run_awk(r#"BEGIN { print "test" > "/dev/null" }"#, "").unwrap();
+    let output = run_awk(
+        &format!(r#"BEGIN {{ print "test" > "{}" }}"#, null_device()),
+        "",
+    )
+    .unwrap();
     assert_eq!(output, "");
 }
 
 #[test]
 fn test_print_redirect_append() {
     // print to file (append mode)
-    let output = run_awk(r#"BEGIN { print "test" >> "/dev/null" }"#, "").unwrap();
+    let output = run_awk(
+        &format!(r#"BEGIN {{ print "test" >> "{}" }}"#, null_device()),
+        "",
+    )
+    .unwrap();
     assert_eq!(output, "");
 }
 
@@ -1755,15 +1785,27 @@ fn test_print_redirect_pipe() {
 
 #[test]
 fn test_printf_redirect() {
-    let output = run_awk(r#"BEGIN { printf "test\n" > "/dev/null" }"#, "").unwrap();
+    let output = run_awk(
+        &format!(r#"BEGIN {{ printf "test\n" > "{}" }}"#, null_device()),
+        "",
+    )
+    .unwrap();
     assert_eq!(output, "");
 }
 
 #[test]
 fn test_getline_from_file() {
-    // getline from file
+    // getline from file. Write a known file first so the test is portable
+    // (e.g. /etc/hostname does not exist on macOS/Windows).
+    let path = temp_file_path("awk_rs_getline_from_file");
     let output = run_awk(
-        r#"BEGIN { while ((getline line < "/etc/hostname") > 0) { print line; break } }"#,
+        &format!(
+            r#"BEGIN {{
+            print "line1" > "{path}"
+            close("{path}")
+            while ((getline line < "{path}") > 0) {{ print line; break }}
+        }}"#
+        ),
         "",
     )
     .unwrap();
@@ -1933,7 +1975,17 @@ fn test_ofmt() {
 
 #[test]
 fn test_environ() {
-    let output = run_awk(r#"BEGIN { print (ENVIRON["PATH"] != "") }"#, "").unwrap();
+    // Pick an env var name that actually exists on this platform. Windows stores
+    // the search path as "Path" (not "PATH"), and ENVIRON lookups are case-sensitive.
+    let var = std::env::vars()
+        .next()
+        .map(|(k, _)| k)
+        .expect("process should have at least one environment variable");
+    let output = run_awk(
+        &format!(r#"BEGIN {{ print (ENVIRON["{var}"] != "") }}"#),
+        "",
+    )
+    .unwrap();
     assert_eq!(output, "1\n");
 }
 
@@ -2336,8 +2388,9 @@ fn test_srand_returns_prev() {
 
 #[test]
 fn test_close_success() {
+    let path = temp_file_path("awk_rs_test_close");
     let output = run_awk(
-        r#"BEGIN { print "test" > "/tmp/awk_rs_test_close"; print close("/tmp/awk_rs_test_close") }"#,
+        &format!(r#"BEGIN {{ print "test" > "{path}"; print close("{path}") }}"#),
         "",
     )
     .unwrap();
@@ -2671,12 +2724,15 @@ fn test_split_whitespace_default() {
 
 #[test]
 fn test_close_file_success() {
+    let path = temp_file_path("awk_rs_close_test");
     let output = run_awk(
-        r#"BEGIN {
-        print "test" > "/tmp/awk_rs_close_test"
-        ret = close("/tmp/awk_rs_close_test")
+        &format!(
+            r#"BEGIN {{
+        print "test" > "{path}"
+        ret = close("{path}")
         print ret
-    }"#,
+    }}"#
+        ),
         "",
     )
     .unwrap();
@@ -2902,12 +2958,16 @@ fn test_expr_statement() {
 
 #[test]
 fn test_print_to_multiple_files() {
+    let path_a = temp_file_path("awk_rs_test_a");
+    let path_b = temp_file_path("awk_rs_test_b");
     let output = run_awk(
-        r#"BEGIN {
-        print "a" > "/tmp/awk_rs_test_a"
-        print "b" > "/tmp/awk_rs_test_b"
+        &format!(
+            r#"BEGIN {{
+        print "a" > "{path_a}"
+        print "b" > "{path_b}"
         print "done"
-    }"#,
+    }}"#
+        ),
         "",
     )
     .unwrap();
@@ -2916,9 +2976,17 @@ fn test_print_to_multiple_files() {
 
 #[test]
 fn test_getline_return_value() {
-    // getline returns 1 on success, 0 on EOF, -1 on error
+    // getline returns 1 on success, 0 on EOF, -1 on error.
+    // Write a known file first so the test is portable across platforms.
+    let path = temp_file_path("awk_rs_getline_return_value");
     let output = run_awk(
-        r#"BEGIN { ret = (getline x < "/etc/hostname"); print (ret >= 0) }"#,
+        &format!(
+            r#"BEGIN {{
+            print "line1" > "{path}"
+            close("{path}")
+            ret = (getline x < "{path}"); print (ret >= 0)
+        }}"#
+        ),
         "",
     )
     .unwrap();

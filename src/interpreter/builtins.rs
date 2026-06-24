@@ -42,13 +42,9 @@ impl<'a> Interpreter<'a> {
             // Extract array names from arguments for pass-by-reference
             let array_refs: Vec<Option<String>> = args
                 .iter()
-                .map(|e| {
-                    if let Expr::Var(name, _) = e
-                        && self.arrays.contains_key(name)
-                    {
-                        return Some(name.clone());
-                    }
-                    None
+                .map(|e| match e {
+                    Expr::Var(name, _) if self.arrays.contains_key(name) => Some(name.clone()),
+                    _ => None,
                 })
                 .collect();
             return self.call_user_function(func, arg_values, array_refs, output);

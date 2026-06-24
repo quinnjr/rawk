@@ -230,12 +230,11 @@ pub fn parse_leading_number(s: &str) -> f64 {
 
     // Fast path for common integer case
     let num_str = &s[start..i];
-    if !num_str.contains('.')
-        && !num_str.contains('e')
-        && !num_str.contains('E')
-        && let Ok(n) = num_str.parse::<i64>()
-    {
-        return n as f64;
+    let is_integer_like =
+        !num_str.contains('.') && !num_str.contains('e') && !num_str.contains('E');
+    match num_str.parse::<i64>() {
+        Ok(n) if is_integer_like => return n as f64,
+        _ => {}
     }
 
     num_str.parse().unwrap_or(0.0)

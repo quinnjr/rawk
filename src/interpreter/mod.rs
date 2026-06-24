@@ -285,9 +285,7 @@ impl<'a> Interpreter<'a> {
 
         // Execute END rules
         for rule in &self.program.rules {
-            if matches!(&rule.pattern, Some(Pattern::End))
-                && let Some(action) = &rule.action
-            {
+            if let (Some(Pattern::End), Some(action)) = (&rule.pattern, &rule.action) {
                 self.execute_block(action, output)?;
             }
         }
