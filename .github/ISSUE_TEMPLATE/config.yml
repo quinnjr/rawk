@@ -7,5 +7,5 @@ contact_links:
     url: https://www.gnu.org/software/gawk/manual/
     about: Reference the GNU AWK documentation for gawk extensions
   - name: Discussions
-    url: https://github.com/quinnjr/awk-rs/discussions
+    url: https://github.com/quinnjr/rawk/discussions
     about: Ask questions and discuss awk-rs

@@ -1,6 +1,6 @@
 # awk-rs
 
-[![CI](https://github.com/quinnjr/awk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/quinnjr/awk-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/quinnjr/rawk/actions/workflows/ci.yml/badge.svg)](https://github.com/quinnjr/rawk/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/awk-rs.svg)](https://crates.io/crates/awk-rs)
 [![Documentation](https://docs.rs/awk-rs/badge.svg)](https://docs.rs/awk-rs)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
@@ -25,8 +25,8 @@ A 100% POSIX-compatible AWK implementation in Rust with GNU AWK (gawk) extension
 ### From Source
 
 ```bash
-git clone https://github.com/quinnjr/awk-rs.git
-cd awk-rs
+git clone https://github.com/quinnjr/rawk.git
+cd rawk
 cargo build --release
 ```
 
