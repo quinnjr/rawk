@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.86"
 description = "A 100% POSIX-compatible AWK implementation in Rust"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pegasusheavy/awk-rs"
+repository = "https://github.com/quinnjr/awk-rs"
 keywords = ["awk", "text-processing", "cli", "posix"]
 categories = ["command-line-utilities", "text-processing"]
 

@@ -1,6 +1,6 @@
 # awk-rs
 
-[![CI](https://github.com/pegasusheavy/awk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/pegasusheavy/awk-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/quinnjr/awk-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/quinnjr/awk-rs/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/awk-rs.svg)](https://crates.io/crates/awk-rs)
 [![Documentation](https://docs.rs/awk-rs/badge.svg)](https://docs.rs/awk-rs)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
@@ -25,7 +25,7 @@ A 100% POSIX-compatible AWK implementation in Rust with GNU AWK (gawk) extension
 ### From Source
 
 ```bash
-git clone https://github.com/pegasusheavy/awk-rs.git
+git clone https://github.com/quinnjr/awk-rs.git
 cd awk-rs
 cargo build --release
 ```
@@ -160,7 +160,7 @@ Licensed under either of:
 
 at your option.
 
-Copyright © 2026 Pegasus Heavy Industries LLC
+Copyright © 2026 Joseph R. Quinn
 
 ## Testing
 

@@ -18,7 +18,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ```bash
 # Clone the repository
-git clone https://github.com/pegasusheavy/awk-rs.git
+git clone https://github.com/quinnjr/awk-rs.git
 cd awk-rs
 
 # Build the project
