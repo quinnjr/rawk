@@ -22,9 +22,21 @@ impl<'a> Interpreter<'a> {
             "split" => return self.call_split(args, location),
             "patsplit" => return self.call_patsplit(args, location),
             "asort" | "asorti" => return self.call_asort(name == "asorti", args, location),
-            "getline" => return self.call_getline(args, location),
             "close" => return self.call_close(args, location),
             "fflush" => return self.call_fflush(args, location, output),
+            "system" => return self.call_system(args, output),
+            "length" => {
+                // gawk extension: length(array) returns element count.
+                // Only intercept when the sole argument names a known array;
+                // otherwise fall through to the normal scalar handling below.
+                if let Some(Expr::Var(var_name, _)) = args.first() {
+                    // Resolve pass-by-reference aliases so length(a) works on
+                    // arrays received as function parameters.
+                    if let Some(arr) = self.arrays.get(self.resolve_array_name(var_name)) {
+                        return Ok(Value::Number(arr.len() as f64));
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -70,7 +82,7 @@ impl<'a> Interpreter<'a> {
         &mut self,
         name: &str,
         args: &[Expr],
-        location: SourceLocation,
+        _location: SourceLocation,
     ) -> Result<Value> {
         let global = name == "gsub";
 
@@ -97,13 +109,7 @@ impl<'a> Interpreter<'a> {
             (self.record.clone(), None)
         };
 
-        let re = regex::Regex::new(&pattern).map_err(|e| {
-            Error::runtime_at(
-                format!("invalid regex: {}", e),
-                location.line,
-                location.column,
-            )
-        })?;
+        let re = self.get_regex(&pattern)?.clone();
 
         let (new_str, count) = regex_sub_helper(&re, &replacement, &target_value, global);
 
@@ -118,7 +124,7 @@ impl<'a> Interpreter<'a> {
     }
 
     /// Call match with proper regex handling
-    fn call_match(&mut self, args: &[Expr], location: SourceLocation) -> Result<Value> {
+    fn call_match(&mut self, args: &[Expr], _location: SourceLocation) -> Result<Value> {
         let s = args
             .first()
             .map(|e| self.eval_expr(e))
@@ -132,13 +138,7 @@ impl<'a> Interpreter<'a> {
             .transpose()?
             .unwrap_or_default();
 
-        let re = regex::Regex::new(&pattern).map_err(|e| {
-            Error::runtime_at(
-                format!("invalid regex: {}", e),
-                location.line,
-                location.column,
-            )
-        })?;
+        let re = self.get_regex(&pattern)?.clone();
 
         if let Some(m) = re.find(&s) {
             self.rstart = m.start() + 1;
@@ -191,19 +191,18 @@ impl<'a> Interpreter<'a> {
         self.arrays.remove(&array_name);
 
         // Split and populate array
-        let parts: Vec<&str> = if sep == " " {
+        let parts: Vec<&str> = if sep.is_empty() {
+            // gawk extension: empty separator splits into one element per character
+            s.char_indices()
+                .map(|(start, c)| &s[start..start + c.len_utf8()])
+                .collect()
+        } else if sep == " " {
             s.split_whitespace().collect()
         } else if sep.len() == 1 {
             s.split(&sep).collect()
         } else {
-            // Use regex split for multi-char separators
-            let re = regex::Regex::new(&sep).map_err(|e| {
-                Error::runtime_at(
-                    format!("invalid regex: {}", e),
-                    location.line,
-                    location.column,
-                )
-            })?;
+            // Use regex split for multi-char separators (via the shared regex cache)
+            let re = self.get_regex(&sep)?.clone();
             re.split(&s).collect()
         };
 
@@ -361,16 +360,6 @@ impl<'a> Interpreter<'a> {
         Ok(Value::Number(matches.len() as f64))
     }
 
-    /// Call getline with file/pipe/variable handling
-    fn call_getline(&mut self, args: &[Expr], location: SourceLocation) -> Result<Value> {
-        // getline returns: 1 (success), 0 (EOF), -1 (error)
-        // For now, just return 0 (EOF) for unsupported cases
-        // TODO: Implement proper getline with file/pipe support
-        let _ = args;
-        let _ = location;
-        Ok(Value::Number(0.0))
-    }
-
     /// Call close to close a file or pipe
     fn call_close(&mut self, args: &[Expr], location: SourceLocation) -> Result<Value> {
         let filename = args
@@ -415,6 +404,28 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Number(-1.0))
             }
         }
+    }
+
+    /// `system(cmd)`: POSIX requires all buffered output to be flushed before the
+    /// command runs, so its output interleaves with ours in the expected order.
+    fn call_system<W: Write>(&mut self, args: &[Expr], output: &mut W) -> Result<Value> {
+        let cmd = match args.first() {
+            Some(expr) => self.eval_expr(expr)?.to_string_val(),
+            None => String::new(),
+        };
+
+        output.flush().map_err(Error::Io)?;
+        for file in self.output_files.values_mut() {
+            let _ = file.flush();
+        }
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .status()
+            .map(|s| s.code().unwrap_or(-1))
+            .unwrap_or(-1);
+        Ok(Value::Number(status as f64))
     }
 
     fn call_builtin(&mut self, name: &str, args: &[Value]) -> Result<Option<Value>> {
@@ -534,17 +545,6 @@ impl<'a> Interpreter<'a> {
             }
 
             // System functions
-            "system" => {
-                let cmd = args.first().map(|v| v.to_string_val()).unwrap_or_default();
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&cmd)
-                    .status()
-                    .map(|s| s.code().unwrap_or(-1))
-                    .unwrap_or(-1);
-                Ok(Some(Value::Number(status as f64)))
-            }
-
             // === GAWK Extensions ===
 
             // Time functions
@@ -618,32 +618,44 @@ impl<'a> Interpreter<'a> {
                     .map(|v| v.to_string_val())
                     .unwrap_or_else(|| self.record.clone());
 
-                let re = self.get_regex(&pattern)?;
+                let re = self.get_regex(&pattern)?.clone();
 
                 // "g" or "G" means global, otherwise it's the occurrence number
                 let result = if how.eq_ignore_ascii_case("g") {
-                    re.replace_all(&target, replacement.replace("&", "$0").as_str())
-                        .to_string()
-                } else if let Ok(n) = how.parse::<usize>() {
-                    // Replace nth occurrence
+                    let mut result = String::new();
+                    let mut last_end = 0;
+                    for caps in re.captures_iter(&target) {
+                        let m = caps.get(0).unwrap();
+                        result.push_str(&target[last_end..m.start()]);
+                        result.push_str(&apply_replacement(&replacement, &caps, true));
+                        last_end = m.end();
+                    }
+                    result.push_str(&target[last_end..]);
+                    result
+                } else {
+                    // Numeric occurrence (default to the 1st if unparseable, per gawk)
+                    let n = how.parse::<usize>().unwrap_or(1).max(1);
                     let mut count = 0;
                     let mut last_end = 0;
                     let mut result = String::new();
-                    for mat in re.find_iter(&target) {
+                    let mut replaced = false;
+                    for caps in re.captures_iter(&target) {
                         count += 1;
                         if count == n {
-                            result.push_str(&target[last_end..mat.start()]);
-                            result.push_str(&replacement.replace("&", mat.as_str()));
-                            last_end = mat.end();
+                            let m = caps.get(0).unwrap();
+                            result.push_str(&target[last_end..m.start()]);
+                            result.push_str(&apply_replacement(&replacement, &caps, true));
+                            last_end = m.end();
+                            replaced = true;
                             break;
                         }
                     }
-                    result.push_str(&target[last_end..]);
-                    if count < n { target.clone() } else { result }
-                } else {
-                    // Default to first occurrence
-                    re.replace(&target, replacement.replace("&", "$0").as_str())
-                        .to_string()
+                    if !replaced {
+                        target.clone()
+                    } else {
+                        result.push_str(&target[last_end..]);
+                        result
+                    }
                 };
 
                 Ok(Some(Value::from_string(result)))
@@ -758,22 +770,68 @@ fn regex_sub_helper(
     target: &str,
     global: bool,
 ) -> (String, usize) {
-    // Handle & in replacement (matched text)
+    // POSIX/gawk replacement semantics: `&` = matched text, `\&` = literal `&`,
+    // `\\` = literal backslash. sub/gsub don't support `\N` group refs.
     let mut count = 0;
 
     if global {
         let result = re.replace_all(target, |caps: &regex::Captures| {
             count += 1;
-            replacement.replace("&", caps.get(0).map(|m| m.as_str()).unwrap_or(""))
+            apply_replacement(replacement, caps, false)
         });
         (result.to_string(), count)
     } else {
         let result = re.replace(target, |caps: &regex::Captures| {
             count += 1;
-            replacement.replace("&", caps.get(0).map(|m| m.as_str()).unwrap_or(""))
+            apply_replacement(replacement, caps, false)
         });
         (result.to_string(), count)
     }
+}
+
+/// Expand a sub/gsub/gensub replacement string against a regex match.
+///
+/// - `&` is replaced with the whole match text.
+/// - `\&` is a literal `&`.
+/// - `\\` is a literal backslash.
+/// - When `allow_groups` is set (gensub only), `\1`..`\9` are replaced with
+///   the corresponding capture group (empty string if the group didn't
+///   participate in the match).
+/// - Any other backslash sequence is passed through unchanged.
+fn apply_replacement(replacement: &str, caps: &regex::Captures, allow_groups: bool) -> String {
+    let mut result = String::new();
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek().copied() {
+                Some('&') => {
+                    result.push('&');
+                    chars.next();
+                }
+                Some('\\') => {
+                    result.push('\\');
+                    chars.next();
+                }
+                Some(d) if allow_groups && d.is_ascii_digit() && d != '0' => {
+                    chars.next();
+                    let idx = d.to_digit(10).unwrap() as usize;
+                    if let Some(m) = caps.get(idx) {
+                        result.push_str(m.as_str());
+                    }
+                }
+                _ => result.push('\\'),
+            },
+            '&' => {
+                if let Some(m) = caps.get(0) {
+                    result.push_str(m.as_str());
+                }
+            }
+            other => result.push(other),
+        }
+    }
+
+    result
 }
 
 /// Simplified mktime implementation (UTC-based)

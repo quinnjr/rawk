@@ -2,6 +2,7 @@ mod builtins;
 mod expr;
 pub mod stmt;
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -39,6 +40,110 @@ impl Write for OutputFile {
             OutputFile::File(f) => f.flush(),
             OutputFile::Pipe(p) => p.flush(),
         }
+    }
+}
+
+thread_local! {
+    /// Type-erased pointer to the main input reader that is currently being
+    /// processed by [`Interpreter::process_input`].
+    ///
+    /// This exists so that a bare `getline` / `getline var` (which is evaluated
+    /// deep inside expression evaluation) can pull the next record from the very
+    /// same reader the main record loop is draining.
+    ///
+    /// Invariants that make the `unsafe` use of this pointer sound:
+    /// * It is only ever set by [`MainInputGuard::new`], which is created inside
+    ///   `process_input` from a `&mut` borrow of a reader that lives on that
+    ///   stack frame.
+    /// * The guard restores the previous value on drop (including while
+    ///   unwinding), so the pointer is never observable after the reader dies,
+    ///   and nested interpreters/inputs stack correctly.
+    /// * The reader is never touched directly while the guard is alive; every
+    ///   access goes through this pointer, so no two `&mut` are live at once.
+    static MAIN_INPUT: Cell<Option<*mut (dyn BufRead + 'static)>> = const { Cell::new(None) };
+}
+
+/// RAII guard that publishes the active main input reader for bare `getline`.
+struct MainInputGuard {
+    previous: Option<*mut (dyn BufRead + 'static)>,
+}
+
+impl MainInputGuard {
+    /// # Safety
+    /// `reader` must remain valid, and must not be accessed through any other
+    /// reference, for the entire lifetime of the returned guard.
+    unsafe fn new(reader: &mut dyn BufRead) -> Self {
+        let ptr: *mut (dyn BufRead + '_) = reader;
+        // Erase the lifetime; see the invariants documented on MAIN_INPUT.
+        let ptr: *mut (dyn BufRead + 'static) = unsafe { std::mem::transmute(ptr) };
+        let previous = MAIN_INPUT.with(|slot| slot.replace(Some(ptr)));
+        MainInputGuard { previous }
+    }
+}
+
+impl Drop for MainInputGuard {
+    fn drop(&mut self) {
+        MAIN_INPUT.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// Read a single record from `reader`.
+///
+/// Returns `Ok(None)` at end of input. The record separator is stripped.
+/// When `paragraph` is true (RS == ""), a record is a run of non-blank lines
+/// delimited by one or more blank lines.
+fn read_record_from(reader: &mut dyn BufRead, paragraph: bool) -> Result<Option<String>> {
+    let mut line = String::new();
+
+    if !paragraph {
+        let bytes_read = reader.read_line(&mut line).map_err(Error::Io)?;
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        return Ok(Some(line));
+    }
+
+    // Paragraph mode: skip leading blank lines, then accumulate until blank/EOF.
+    let mut record = String::new();
+    let mut in_record = false;
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).map_err(Error::Io)?;
+
+        if bytes_read == 0 {
+            // EOF - emit whatever we have accumulated
+            if in_record && !record.is_empty() {
+                return Ok(Some(record));
+            }
+            return Ok(None);
+        }
+
+        if line.trim().is_empty() {
+            if in_record && !record.is_empty() {
+                return Ok(Some(record));
+            }
+            // Leading blank line - skip it
+            continue;
+        }
+
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        if in_record {
+            record.push('\n');
+        }
+        record.push_str(&line);
+        in_record = true;
     }
 }
 
@@ -92,6 +197,10 @@ pub struct Interpreter<'a> {
     pub(crate) fnr: usize,
     /// Current filename (FILENAME)
     pub(crate) filename: String,
+
+    /// Names of the input sources passed to `run()`, in order.
+    /// Used to keep FILENAME correct across a multi-file run.
+    pub(crate) filenames: Vec<String>,
 
     /// RSTART and RLENGTH from match()
     pub(crate) rstart: usize,
@@ -173,6 +282,7 @@ impl<'a> Interpreter<'a> {
             nr: 0,
             fnr: 0,
             filename: String::new(),
+            filenames: Vec::new(),
             rstart: 0,
             rlength: -1,
             should_exit: false,
@@ -234,6 +344,18 @@ impl<'a> Interpreter<'a> {
         self.filename = filename.to_string();
     }
 
+    /// Set the names of the input sources that will be passed to [`Self::run`].
+    ///
+    /// The i-th name is installed into FILENAME before the i-th reader is
+    /// processed, so a single `run()` call over several files still reports the
+    /// correct FILENAME while keeping BEGIN/END to one execution each.
+    pub fn set_filenames(&mut self, filenames: Vec<String>) {
+        if let Some(first) = filenames.first() {
+            self.filename = first.clone();
+        }
+        self.filenames = filenames;
+    }
+
     /// Run the AWK program with given input
     pub fn run<R: BufRead, W: Write>(&mut self, inputs: Vec<R>, output: &mut W) -> Result<i32> {
         // Execute BEGIN rules
@@ -249,8 +371,13 @@ impl<'a> Interpreter<'a> {
         }
 
         // Process input files
-        for input in inputs {
+        for (idx, input) in inputs.into_iter().enumerate() {
             self.fnr = 0;
+
+            // Keep FILENAME correct per file within this single run.
+            if let Some(name) = self.filenames.get(idx) {
+                self.filename = name.clone();
+            }
 
             // Execute BEGINFILE rules (gawk extension)
             for rule in &self.program.rules {
@@ -294,31 +421,19 @@ impl<'a> Interpreter<'a> {
     }
 
     fn process_input<R: BufRead, W: Write>(&mut self, mut input: R, output: &mut W) -> Result<()> {
-        // Check for paragraph mode (RS = "")
-        if self.rs.is_empty() {
-            return self.process_input_paragraph_mode(input, output);
-        }
+        // Publish the reader so that a bare `getline` can pull from it too.
+        // The guard clears it again when this frame ends (see MAIN_INPUT).
+        let _guard = unsafe { MainInputGuard::new(&mut input) };
+        self.process_input_loop(output)
+    }
 
-        let mut line = String::new();
-
-        loop {
-            line.clear();
-            let bytes_read = input.read_line(&mut line).map_err(Error::Io)?;
-            if bytes_read == 0 {
-                break; // EOF
-            }
-
-            // Remove record separator
-            if line.ends_with('\n') {
-                line.pop();
-                if line.ends_with('\r') {
-                    line.pop();
-                }
-            }
-
+    /// The main record loop. Records are pulled through `next_main_record` so
+    /// that bare `getline` shares the exact same reader position.
+    fn process_input_loop<W: Write>(&mut self, output: &mut W) -> Result<()> {
+        while let Some(record) = self.next_main_record()? {
             self.nr += 1;
             self.fnr += 1;
-            self.set_record(&line);
+            self.set_record(&record);
 
             self.process_current_record(output)?;
 
@@ -335,80 +450,21 @@ impl<'a> Interpreter<'a> {
         Ok(())
     }
 
-    /// Process input in paragraph mode (RS = "")
-    /// Blank lines separate records; multiple blank lines count as one separator
-    fn process_input_paragraph_mode<R: BufRead, W: Write>(
-        &mut self,
-        mut input: R,
-        output: &mut W,
-    ) -> Result<()> {
-        let mut line = String::new();
-        let mut record = String::new();
-        let mut in_record = false;
-
-        loop {
-            line.clear();
-            let bytes_read = input.read_line(&mut line).map_err(Error::Io)?;
-
-            // Check if line is blank (empty or only whitespace)
-            let is_blank = line.trim().is_empty();
-
-            if bytes_read == 0 {
-                // EOF - process any remaining record
-                if !record.is_empty() {
-                    // Remove trailing newline
-                    while record.ends_with('\n') || record.ends_with('\r') {
-                        record.pop();
-                    }
-                    self.nr += 1;
-                    self.fnr += 1;
-                    self.set_record(&record);
-                    self.process_current_record(output)?;
-                }
-                break;
-            }
-
-            if is_blank {
-                // Blank line - end of record if we're in one
-                if in_record && !record.is_empty() {
-                    // Remove trailing newline
-                    while record.ends_with('\n') || record.ends_with('\r') {
-                        record.pop();
-                    }
-                    self.nr += 1;
-                    self.fnr += 1;
-                    self.set_record(&record);
-                    self.process_current_record(output)?;
-
-                    record.clear();
-                    in_record = false;
-
-                    if self.should_nextfile || self.should_exit {
-                        break;
-                    }
-                }
-            } else {
-                // Non-blank line - add to record
-                if in_record {
-                    record.push('\n');
-                }
-                // Remove trailing newline from line before adding
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                record.push_str(&line);
-                in_record = true;
-            }
+    /// Read the next record from the main input, honouring paragraph mode
+    /// (RS == ""). Returns `Ok(None)` at EOF or when there is no main input
+    /// (e.g. inside BEGIN before any file has been opened).
+    ///
+    /// Does *not* touch NR/FNR/$0 - callers decide what to update.
+    pub(crate) fn next_main_record(&mut self) -> Result<Option<String>> {
+        let paragraph = self.rs.is_empty();
+        let ptr = MAIN_INPUT.with(|slot| slot.get());
+        match ptr {
+            // SAFETY: the pointer is only ever non-null while the guard created
+            // in `process_input` is alive, which keeps the reader borrowed and
+            // untouched by anything else. See MAIN_INPUT for the full argument.
+            Some(ptr) => read_record_from(unsafe { &mut *ptr }, paragraph),
+            None => Ok(None),
         }
-
-        if self.should_nextfile {
-            self.should_nextfile = false;
-        }
-
-        Ok(())
     }
 
     /// Process the current record through all matching rules
@@ -820,9 +876,22 @@ impl<'a> Interpreter<'a> {
     pub(crate) fn make_array_key(&self, indices: &[Value]) -> String {
         indices
             .iter()
-            .map(|v| v.to_string_val())
+            .map(|v| self.to_conv_str(v))
             .collect::<Vec<_>>()
             .join(&self.subsep)
+    }
+
+    /// Convert a value to a string for use inside an expression (concatenation,
+    /// string comparison, array subscripts, ...), honoring CONVFMT.
+    #[inline]
+    pub(crate) fn to_conv_str(&self, value: &Value) -> String {
+        value.to_string_with_format(&self.convfmt)
+    }
+
+    /// Convert a value to a string for `print`, honoring OFMT.
+    #[inline]
+    pub(crate) fn to_output_str(&self, value: &Value) -> String {
+        value.to_string_with_format(&self.ofmt)
     }
 }
 
@@ -1169,9 +1238,80 @@ mod tests {
 
     #[test]
     fn test_getline_var() {
+        // Reading "a", getline pulls "b" into next_line without touching $0.
         let output = run_awk("{ getline next_line; print $0, next_line }", "a\nb");
-        // When we read "a", getline reads "b" into next_line
-        assert!(output.contains("a") && output.contains("b"));
+        assert_eq!(output, "a b\n");
+    }
+
+    #[test]
+    fn test_getline_var_updates_nr_but_not_record() {
+        // `getline var` advances NR/FNR but leaves $0 and NF alone.
+        let output = run_awk(
+            "{ getline v; print $0 \"|\" v \"|\" NR \"|\" NF }",
+            "a b\nc d",
+        );
+        assert_eq!(output, "a b|c d|2|2\n");
+    }
+
+    #[test]
+    fn test_bare_getline_sets_record() {
+        // Bare getline replaces $0 (and NF) with the next record.
+        let output = run_awk("{ getline; print $0, NF, NR }", "a\nx y z");
+        assert_eq!(output, "x y z 3 2\n");
+    }
+
+    #[test]
+    fn test_bare_getline_returns_zero_at_eof() {
+        let output = run_awk("{ r = getline; print r, $0 }", "a\nb\nc");
+        assert_eq!(output, "1 b\n0 c\n");
+    }
+
+    #[test]
+    fn test_getline_in_begin_without_input_is_eof() {
+        // No main input is open during BEGIN, so getline reports EOF.
+        let output = run_awk("BEGIN { print getline }", "");
+        assert_eq!(output, "0\n");
+    }
+
+    #[test]
+    fn test_begin_end_run_once_over_multiple_inputs() {
+        let mut lexer = Lexer::new(r#"BEGIN { print "hi" } END { print NR }"#);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse().unwrap();
+
+        let mut interpreter = Interpreter::new(&ast);
+        interpreter.set_filenames(vec!["one".to_string(), "two".to_string()]);
+        let mut output = Vec::new();
+        let inputs = vec![
+            std::io::BufReader::new(Cursor::new("a\nb\n")),
+            std::io::BufReader::new(Cursor::new("c\n")),
+        ];
+        interpreter.run(inputs, &mut output).unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "hi\n3\n");
+    }
+
+    #[test]
+    fn test_filename_and_fnr_track_each_input() {
+        let mut lexer = Lexer::new("{ print FILENAME, NR, FNR }");
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let ast = parser.parse().unwrap();
+
+        let mut interpreter = Interpreter::new(&ast);
+        interpreter.set_filenames(vec!["one".to_string(), "two".to_string()]);
+        let mut output = Vec::new();
+        let inputs = vec![
+            std::io::BufReader::new(Cursor::new("a\nb\n")),
+            std::io::BufReader::new(Cursor::new("c\n")),
+        ];
+        interpreter.run(inputs, &mut output).unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "one 1 1\none 2 2\ntwo 3 1\n"
+        );
     }
 
     #[test]

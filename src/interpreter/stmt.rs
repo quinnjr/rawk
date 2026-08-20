@@ -220,16 +220,6 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(StmtResult::Normal)
             }
-
-            Stmt::Getline {
-                var,
-                input,
-                location,
-            } => {
-                // Getline as a statement
-                let _result = self.eval_getline(var.as_ref(), input.as_ref(), *location)?;
-                Ok(StmtResult::Normal)
-            }
         }
     }
 
@@ -242,8 +232,8 @@ impl<'a> Interpreter<'a> {
         let values: Result<Vec<String>> = args
             .iter()
             .map(|e| {
-                self.eval_expr_with_output(e, default_output)
-                    .map(|v| v.to_string_val())
+                let v = self.eval_expr_with_output(e, default_output)?;
+                Ok(self.to_output_str(&v))
             })
             .collect();
         let values = values?;
@@ -371,143 +361,6 @@ impl<'a> Interpreter<'a> {
     }
 
     pub(crate) fn format_printf(&self, format: &str, args: &[Value]) -> String {
-        let mut result = String::new();
-        let mut chars = format.chars().peekable();
-        let mut arg_idx = 0;
-
-        while let Some(ch) = chars.next() {
-            if ch != '%' {
-                result.push(ch);
-                continue;
-            }
-
-            // Check for %%
-            if chars.peek() == Some(&'%') {
-                chars.next();
-                result.push('%');
-                continue;
-            }
-
-            // Parse format specifier
-            let mut width = String::new();
-            let mut precision = String::new();
-            let mut flags = String::new();
-
-            // Flags
-            while let Some(&c) = chars.peek() {
-                if c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' {
-                    flags.push(c);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            // Width
-            while let Some(&c) = chars.peek() {
-                if c.is_ascii_digit() {
-                    width.push(c);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            // Precision
-            if chars.peek() == Some(&'.') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    if c.is_ascii_digit() {
-                        precision.push(c);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            // Conversion specifier
-            let spec = chars.next().unwrap_or('s');
-            let arg = args.get(arg_idx).cloned().unwrap_or(Value::Uninitialized);
-            arg_idx += 1;
-
-            let width_num: Option<usize> = width.parse().ok();
-            let precision_num: Option<usize> = precision.parse().ok();
-            let left_align = flags.contains('-');
-
-            let formatted = match spec {
-                's' => {
-                    let s = arg.to_string_val();
-                    let s = if let Some(p) = precision_num {
-                        s.chars().take(p).collect()
-                    } else {
-                        s
-                    };
-                    if let Some(w) = width_num {
-                        if left_align {
-                            format!("{:<width$}", s, width = w)
-                        } else {
-                            format!("{:>width$}", s, width = w)
-                        }
-                    } else {
-                        s
-                    }
-                }
-                'd' | 'i' => {
-                    let n = arg.to_number() as i64;
-                    if let Some(w) = width_num {
-                        if flags.contains('0') && !left_align {
-                            format!("{:0>width$}", n, width = w)
-                        } else if left_align {
-                            format!("{:<width$}", n, width = w)
-                        } else {
-                            format!("{:>width$}", n, width = w)
-                        }
-                    } else {
-                        format!("{}", n)
-                    }
-                }
-                'f' | 'F' => {
-                    let n = arg.to_number();
-                    let p = precision_num.unwrap_or(6);
-                    if let Some(w) = width_num {
-                        if left_align {
-                            format!("{:<width$.prec$}", n, width = w, prec = p)
-                        } else {
-                            format!("{:>width$.prec$}", n, width = w, prec = p)
-                        }
-                    } else {
-                        format!("{:.prec$}", n, prec = p)
-                    }
-                }
-                'e' | 'E' => {
-                    let n = arg.to_number();
-                    let p = precision_num.unwrap_or(6);
-                    format!("{:.prec$e}", n, prec = p)
-                }
-                'g' | 'G' => {
-                    let n = arg.to_number();
-                    let p = precision_num.unwrap_or(6);
-                    // Simplified %g implementation
-                    if n.abs() >= 1e-4 && n.abs() < 10f64.powi(p as i32) {
-                        format!("{:.prec$}", n, prec = p)
-                    } else {
-                        format!("{:.prec$e}", n, prec = p)
-                    }
-                }
-                'o' => format!("{:o}", arg.to_number() as u64),
-                'x' => format!("{:x}", arg.to_number() as u64),
-                'X' => format!("{:X}", arg.to_number() as u64),
-                'c' => {
-                    let n = arg.to_number() as u32;
-                    char::from_u32(n).map(|c| c.to_string()).unwrap_or_default()
-                }
-                _ => format!("%{}", spec),
-            };
-
-            result.push_str(&formatted);
-        }
-
-        result
+        crate::fmt::sprintf(format, args)
     }
 }

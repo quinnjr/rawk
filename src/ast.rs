@@ -182,13 +182,6 @@ pub enum Stmt {
         location: SourceLocation,
     },
 
-    /// Getline statement (various forms)
-    Getline {
-        var: Option<String>,
-        input: Option<GetlineInput>,
-        location: SourceLocation,
-    },
-
     /// Empty statement (just a semicolon)
     Empty,
 }
@@ -303,12 +296,10 @@ pub enum Expr {
         location: SourceLocation,
     },
 
-    /// Concatenation (implicit when expressions are adjacent)
-    Concat(Vec<Expr>, SourceLocation),
-
     /// Getline as expression (returns status)
     Getline {
-        var: Option<String>,
+        /// Target lvalue (variable, array element, or field); `None` sets $0.
+        var: Option<Box<Expr>>,
         input: Option<GetlineInput>,
         location: SourceLocation,
     },
@@ -337,7 +328,6 @@ impl Expr {
             | Expr::Call { location: loc, .. }
             | Expr::InArray { location: loc, .. }
             | Expr::Match { location: loc, .. }
-            | Expr::Concat(_, loc)
             | Expr::Getline { location: loc, .. }
             | Expr::Group(_, loc) => *loc,
         }
