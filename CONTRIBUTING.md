@@ -18,8 +18,8 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ```bash
 # Clone the repository
-git clone https://github.com/pegasusheavy/awk-rs.git
-cd awk-rs
+git clone https://github.com/quinnjr/rawk.git
+cd rawk
 
 # Build the project
 cargo build

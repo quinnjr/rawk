@@ -48,7 +48,6 @@ jobs:
 
       - name: Check dependencies
         run: cargo deny check
-        continue-on-error: true  # Don't fail on first run without deny.toml
 
   outdated:
     name: Outdated Dependencies

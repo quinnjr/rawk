@@ -83,7 +83,7 @@ Initial release of awk-rs - a 100% POSIX-compatible AWK implementation in Rust.
 ### License
 
 Dual-licensed under MIT and Apache 2.0.
-Copyright (c) 2026 Pegasus Heavy Industries LLC.
+Copyright (c) 2026 Joseph R. Quinn.
 
 ---
 
