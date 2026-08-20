@@ -1,9 +1,118 @@
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::process;
 
 use awk_rs::{Interpreter, Lexer, Parser};
+
+/// Decode AWK escape sequences in a command-line assignment value.
+///
+/// POSIX requires `-v x='a\tb'` to be processed exactly like a string literal,
+/// so this mirrors the lexer's string escape handling.
+fn unescape_assignment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('r') => {
+                chars.next();
+                out.push('\r');
+            }
+            Some('b') => {
+                chars.next();
+                out.push('\x08');
+            }
+            Some('f') => {
+                chars.next();
+                out.push('\x0C');
+            }
+            Some('a') => {
+                chars.next();
+                out.push('\x07');
+            }
+            Some('v') => {
+                chars.next();
+                out.push('\x0B');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            Some('"') => {
+                chars.next();
+                out.push('"');
+            }
+            Some('/') => {
+                chars.next();
+                out.push('/');
+            }
+            Some(d) if d.is_digit(8) => {
+                // Octal escape: \NNN (1-3 octal digits)
+                let mut octal = String::new();
+                while octal.len() < 3 {
+                    match chars.peek().copied() {
+                        Some(d) if d.is_digit(8) => {
+                            octal.push(d);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                match u8::from_str_radix(&octal, 8) {
+                    Ok(b) => out.push(b as char),
+                    Err(_) => {
+                        out.push('\\');
+                        out.push_str(&octal);
+                    }
+                }
+            }
+            Some('x') => {
+                // Hex escape: \x followed by 1-2 hex digits (gawk extension),
+                // mirroring the lexer's string-literal handling.
+                chars.next(); // consume 'x'
+                let mut hex = String::new();
+                while hex.len() < 2 {
+                    match chars.peek().copied() {
+                        Some(d) if d.is_ascii_hexdigit() => {
+                            hex.push(d);
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                match u8::from_str_radix(&hex, 16) {
+                    Ok(b) => out.push(b as char),
+                    Err(_) => {
+                        out.push('x');
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => {
+                // Unknown escape: use the character itself
+                chars.next();
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -68,7 +177,7 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
             }
             let var_assign = &args[i];
             if let Some((name, value)) = var_assign.split_once('=') {
-                variables.push((name.to_string(), value.to_string()));
+                variables.push((name.to_string(), unescape_assignment(value)));
             } else {
                 return Err(format!("invalid variable assignment: {}", var_assign).into());
             }
@@ -129,30 +238,29 @@ fn run(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let mut output = stdout.lock();
 
-    // Prepare inputs
-    let exit_code = if input_files.is_empty() {
+    // Prepare inputs: BEGIN/END must run exactly once for the whole run, so all
+    // input files are handed to a single run() call. FILENAME is tracked per
+    // file through set_filenames().
+    let mut inputs: Vec<Box<dyn BufRead>> = Vec::new();
+    let mut filenames: Vec<String> = Vec::new();
+
+    if input_files.is_empty() {
         // Read from stdin
-        interpreter.set_filename("");
-        let stdin = io::stdin();
-        let inputs = vec![BufReader::new(stdin.lock())];
-        interpreter.run(inputs, &mut output)?
+        inputs.push(Box::new(BufReader::new(io::stdin())));
+        filenames.push(String::new());
     } else {
-        // Read from files
-        let mut exit_code = 0;
         for filename in &input_files {
-            interpreter.set_filename(filename);
             if filename == "-" {
-                let stdin = io::stdin();
-                let inputs = vec![BufReader::new(stdin.lock())];
-                exit_code = interpreter.run(inputs, &mut output)?;
+                inputs.push(Box::new(BufReader::new(io::stdin())));
             } else {
-                let file = File::open(filename)?;
-                let inputs = vec![BufReader::new(file)];
-                exit_code = interpreter.run(inputs, &mut output)?;
+                inputs.push(Box::new(BufReader::new(File::open(filename)?)));
             }
+            filenames.push(filename.clone());
         }
-        exit_code
-    };
+    }
+
+    interpreter.set_filenames(filenames);
+    let exit_code = interpreter.run(inputs, &mut output)?;
 
     Ok(exit_code)
 }

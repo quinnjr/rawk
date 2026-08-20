@@ -154,14 +154,28 @@ impl fmt::Display for Value {
 /// Compare two AWK values according to AWK comparison rules
 #[inline]
 pub fn compare_values(left: &Value, right: &Value) -> Ordering {
+    compare_values_with_format(left, right, "%.6g")
+}
+
+/// Compare two AWK values, using `convfmt` (CONVFMT) when a number has to be
+/// converted to a string for a string comparison.
+#[inline]
+pub fn compare_values_with_format(left: &Value, right: &Value, convfmt: &str) -> Ordering {
     // If both are numeric or numeric strings, compare numerically
     if left.compares_as_number() && right.compares_as_number() {
         let l = left.to_number();
         let r = right.to_number();
         l.partial_cmp(&r).unwrap_or(Ordering::Equal)
     } else {
-        // Otherwise compare as strings - use as_str to avoid allocation
-        left.as_str().cmp(&right.as_str())
+        // Otherwise compare as strings
+        match (left, right) {
+            // Slow path: at least one Number operand needs CONVFMT formatting.
+            (Value::Number(_), _) | (_, Value::Number(_)) => left
+                .to_string_with_format(convfmt)
+                .cmp(&right.to_string_with_format(convfmt)),
+            // Fast path: no Number operand, so CONVFMT is never applied.
+            _ => left.as_str().cmp(&right.as_str()),
+        }
     }
 }
 
@@ -294,27 +308,16 @@ pub fn format_number(n: f64, format: &str) -> String {
         return if n > 0.0 { "inf" } else { "-inf" }.to_string();
     }
 
-    // Handle %.6g (default OFMT) - optimized path
-    if format == "%.6g" {
-        // If it's an integer, print without decimal
-        if n.fract() == 0.0 && n.abs() < 1e15 {
+    // POSIX: values that are exactly integral convert as integers, with no
+    // format applied at all.
+    if n.fract() == 0.0 {
+        if n.abs() < 1e15 {
             return itoa_fast(n as i64);
         }
-        // Otherwise use default formatting with reasonable precision
-        let s = format!("{:.6}", n);
-        // Trim trailing zeros after decimal point
-        if s.contains('.') {
-            let trimmed = s.trim_end_matches('0');
-            if let Some(stripped) = trimmed.strip_suffix('.') {
-                return stripped.to_string();
-            }
-            return trimmed.to_string();
-        }
-        return s;
+        return format!("{:.0}", n);
     }
 
-    // Fallback
-    format!("{}", n)
+    crate::fmt::sprintf(format, &[Value::Number(n)])
 }
 
 /// Fast integer to string conversion

@@ -288,9 +288,10 @@ fn test_string_comparison() {
 
 #[test]
 fn test_numeric_string_comparison() {
-    // Both are numeric strings, should compare numerically
+    // String literals are pure strings (not strnums), so this is a string
+    // comparison: "10" < "9" lexicographically. Matches gawk.
     let output = run_awk(r#"BEGIN { print ("10" > "9") }"#, "").unwrap();
-    assert_eq!(output, "1\n");
+    assert_eq!(output, "0\n");
 }
 
 // ============================================================================
@@ -657,6 +658,48 @@ fn test_printf_char() {
 fn test_printf_percent() {
     let output = run_awk(r#"BEGIN { printf "100%%\n" }"#, "").unwrap();
     assert_eq!(output, "100%\n");
+}
+
+#[test]
+fn test_printf_char_string_arg() {
+    let output = run_awk(r#"BEGIN{printf "%c\n", "hello"}"#, "").unwrap();
+    assert_eq!(output, "h\n");
+}
+
+#[test]
+fn test_printf_star_width() {
+    let output = run_awk(r#"BEGIN { printf "%*d\n", 6, 42 }"#, "").unwrap();
+    assert_eq!(output, "    42\n");
+}
+
+#[test]
+fn test_printf_plus_flag() {
+    let output = run_awk(r#"BEGIN { printf "%+d %+d\n", 5, -5 }"#, "").unwrap();
+    assert_eq!(output, "+5 -5\n");
+}
+
+#[test]
+fn test_printf_hash_hex() {
+    let output = run_awk(r#"BEGIN { printf "%#x %#X\n", 255, 255 }"#, "").unwrap();
+    assert_eq!(output, "0xff 0XFF\n");
+}
+
+#[test]
+fn test_printf_hash_octal() {
+    let output = run_awk(r#"BEGIN { printf "%#o\n", 8 }"#, "").unwrap();
+    assert_eq!(output, "010\n");
+}
+
+#[test]
+fn test_printf_width_precision_exp() {
+    let output = run_awk(r#"BEGIN { printf "[%10.3e]\n", 12345.6789 }"#, "").unwrap();
+    assert_eq!(output, "[ 1.235e+04]\n");
+}
+
+#[test]
+fn test_printf_left_align_hex() {
+    let output = run_awk(r#"BEGIN { printf "[%-8x]\n", 255 }"#, "").unwrap();
+    assert_eq!(output, "[ff      ]\n");
 }
 
 // ============================================================================
@@ -1658,8 +1701,8 @@ fn test_uninitialized_string() {
 #[test]
 fn test_numeric_string_gt_comparison() {
     let output = run_awk(r#"BEGIN { print ("10" > "9") }"#, "").unwrap();
-    // Numeric comparison: 10 > 9
-    assert_eq!(output, "1\n");
+    // String literals compare as strings: "10" < "9" lexicographically (gawk).
+    assert_eq!(output, "0\n");
 }
 
 #[test]
@@ -1819,6 +1862,90 @@ fn test_getline_from_pipe() {
 }
 
 #[test]
+fn test_getline_into_array_element_from_file() {
+    let path = temp_file_path("awk_rs_getline_array_file");
+    let output = run_awk(
+        &format!(
+            r#"BEGIN {{
+            print "p q" > "{path}"
+            print "r s" > "{path}"
+            close("{path}")
+            getline arr[1] < "{path}"
+            getline arr[2] < "{path}"
+            print arr[1] "|" arr[2]
+        }}"#
+        ),
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "p q|r s\n");
+}
+
+#[test]
+fn test_getline_into_array_element_with_expression_subscript() {
+    let path = temp_file_path("awk_rs_getline_array_expr");
+    let output = run_awk(
+        &format!(
+            r#"BEGIN {{
+            print "one" > "{path}"
+            print "two" > "{path}"
+            close("{path}")
+            n = 0
+            while ((getline arr[n + 1] < "{path}") > 0) n++
+            print n, arr[1], arr[2]
+        }}"#
+        ),
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "2 one two\n");
+}
+
+#[test]
+fn test_pipe_getline_into_array_element() {
+    let output = run_awk(r#"BEGIN { "echo zz" | getline arr[1]; print arr[1] }"#, "").unwrap();
+    assert_eq!(output, "zz\n");
+}
+
+#[test]
+fn test_pipe_getline_into_field() {
+    // Assigning through a field target rebuilds $0 and NF, like gawk.
+    let output = run_awk(r#"{ "echo hi" | getline $2; print; print NF }"#, "a b c\n").unwrap();
+    assert_eq!(output, "a hi c\n3\n");
+}
+
+#[test]
+fn test_getline_into_field_from_file() {
+    let path = temp_file_path("awk_rs_getline_field_file");
+    let output = run_awk(
+        &format!(
+            r#"BEGIN {{
+            print "hello" > "{path}"
+            close("{path}")
+            $0 = "a b c"
+            getline $3 < "{path}"
+            print $0
+            print NF
+        }}"#
+        ),
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "a b hello\n3\n");
+}
+
+#[test]
+fn test_getline_var_does_not_touch_record() {
+    // `getline var` forms leave $0/NF alone.
+    let output = run_awk(
+        r#"{ "echo x y z" | getline v; print v; print $0; print NF }"#,
+        "a b\n",
+    )
+    .unwrap();
+    assert_eq!(output, "x y z\na b\n2\n");
+}
+
+#[test]
 fn test_getline_sets_nf() {
     let output = run_awk(r#"BEGIN { "echo a b c" | getline; print NF }"#, "").unwrap();
     assert_eq!(output, "3\n");
@@ -1963,14 +2090,75 @@ fn test_custom_subsep() {
 
 #[test]
 fn test_convfmt() {
+    // CONVFMT controls number -> string conversion in expressions.
     let output = run_awk(r#"BEGIN { CONVFMT = "%.2f"; x = 3.14159; print x "" }"#, "").unwrap();
-    assert!(output.contains("3.14"));
+    assert_eq!(output, "3.14\n");
+
+    let output = run_awk(
+        r#"BEGIN { CONVFMT = "%.2g"; x = 3.14159; y = x ""; print y }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "3.1\n");
+}
+
+#[test]
+fn test_convfmt_default() {
+    // Default CONVFMT is "%.6g".
+    let output = run_awk(r#"BEGIN { x = 1 / 3; print x "" }"#, "").unwrap();
+    assert_eq!(output, "0.333333\n");
+}
+
+#[test]
+fn test_convfmt_integral_values_ignore_format() {
+    // POSIX: integral values always convert as integers, regardless of CONVFMT.
+    let output = run_awk(
+        r#"BEGIN { CONVFMT = "%.2g"; x = 100000000; print x "" }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "100000000\n");
+}
+
+#[test]
+fn test_convfmt_array_subscript() {
+    // Array subscripts are built with CONVFMT.
+    let output = run_awk(
+        r#"BEGIN { CONVFMT = "%.2g"; a[3.14159] = 1; for (k in a) print k }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "3.1\n");
+
+    let output = run_awk(
+        r#"BEGIN { CONVFMT = "%.2g"; a[3.14159, 2] = 1; for (k in a) { split(k, p, SUBSEP); print p[1] } }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "3.1\n");
 }
 
 #[test]
 fn test_ofmt() {
+    // OFMT controls how non-integral numbers are printed by `print`.
     let output = run_awk(r#"BEGIN { OFMT = "%.2f"; print 3.14159 }"#, "").unwrap();
-    assert!(output.contains("3.14"));
+    assert_eq!(output, "3.14\n");
+
+    let output = run_awk(r#"BEGIN { OFMT = "%.4f"; print 3.14159, 2.5, "x" }"#, "").unwrap();
+    assert_eq!(output, "3.1416 2.5000 x\n");
+}
+
+#[test]
+fn test_ofmt_integral_values_ignore_format() {
+    let output = run_awk(r#"BEGIN { OFMT = "%.2f"; print 100 }"#, "").unwrap();
+    assert_eq!(output, "100\n");
+}
+
+#[test]
+fn test_ofmt_does_not_affect_concatenation() {
+    // Concatenation uses CONVFMT (default "%.6g"), not OFMT.
+    let output = run_awk(r#"BEGIN { OFMT = "%.2f"; x = 3.14159; print x "" }"#, "").unwrap();
+    assert_eq!(output, "3.14159\n");
 }
 
 #[test]
@@ -3287,4 +3475,133 @@ fn test_function_shadowing_global() {
     )
     .unwrap();
     assert_eq!(output, "10 10\n");
+}
+
+// --- Finding 5: `\&` and `\\` in sub/gsub/gensub replacement text ---
+
+#[test]
+fn test_gsub_escaped_ampersand() {
+    let output = run_awk(r#"BEGIN{s="foo"; gsub(/o/,"[\\&]",s); print s}"#, "").unwrap();
+    assert_eq!(output, "f[&][&]\n");
+}
+
+#[test]
+fn test_sub_escaped_ampersand() {
+    let output = run_awk(r#"BEGIN{s="foo"; sub(/o/,"[\\&]",s); print s}"#, "").unwrap();
+    assert_eq!(output, "f[&]o\n");
+}
+
+#[test]
+fn test_gsub_bare_ampersand_still_matches() {
+    let output = run_awk(r#"BEGIN{s="foo"; gsub(/o/,"[&]",s); print s}"#, "").unwrap();
+    assert_eq!(output, "f[o][o]\n");
+}
+
+#[test]
+fn test_gsub_escaped_backslash() {
+    let output = run_awk(r#"BEGIN{s="foo"; gsub(/o/,"\\\\",s); print s}"#, "").unwrap();
+    assert_eq!(output, "f\\\\\n");
+}
+
+#[test]
+fn test_gensub_escaped_ampersand() {
+    let output = run_awk(r#"BEGIN{print gensub("o","[\\&]","g","foo")}"#, "").unwrap();
+    assert_eq!(output, "f[&][&]\n");
+}
+
+// --- Finding 6: length(array) returns element count ---
+
+#[test]
+fn test_length_of_array() {
+    let output = run_awk(r#"BEGIN{a[1]=1;a[2]=2;print length(a)}"#, "").unwrap();
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn test_length_of_string_still_works() {
+    let output = run_awk(r#"BEGIN{print length("hello")}"#, "").unwrap();
+    assert_eq!(output, "5\n");
+}
+
+// --- Finding 11: split(s, a, "") splits per character ---
+
+#[test]
+fn test_split_empty_separator() {
+    let output = run_awk(r#"BEGIN{n=split("abc",a,""); print n, a[1], a[3]}"#, "").unwrap();
+    assert_eq!(output, "3 a c\n");
+}
+
+// --- Finding 9: regex cache is used (behavioral smoke test via repeated calls) ---
+
+#[test]
+fn test_split_multichar_regex_separator_repeated() {
+    let output = run_awk(
+        r#"BEGIN{
+            for (i = 0; i < 3; i++) {
+                n = split("a::b::c", arr, "::");
+                print n, arr[1], arr[2], arr[3];
+            }
+        }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "3 a b c\n3 a b c\n3 a b c\n");
+}
+
+#[test]
+fn test_string_literals_compare_as_strings() {
+    // gawk: string literals are pure strings, not strnums, so "10" < "9"
+    // is a string comparison (true), not a numeric one.
+    let output = run_awk(
+        r#"BEGIN { if ("10" < "9") print "string"; else print "numeric" }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "string\n");
+}
+
+#[test]
+fn test_numeric_vs_string_literal_uses_convfmt() {
+    // gawk: x is numeric, "3.1" is a plain string, so x converts to a
+    // string via CONVFMT ("%.2g" -> "3.1") and the comparison is equal.
+    let output = run_awk(
+        r#"BEGIN { CONVFMT = "%.2g"; x = 3.14159; if (x == "3.1") print "eq"; else print "ne" }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "eq\n");
+}
+
+#[test]
+fn test_getline_evaluates_subscript_on_eof() {
+    // gawk evaluates the target's subscript expression even when the read
+    // hits EOF, so the loop leaves n one past the number of records read.
+    let path = temp_file_path("awk_rs_getline_subscript_eof");
+    let output = run_awk(
+        &format!(
+            r#"BEGIN {{
+            print "hello" > "{path}"
+            close("{path}")
+            n = 0
+            while ((getline a[++n] < "{path}") > 0) ;
+            print n
+        }}"#
+        ),
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "2\n");
+}
+
+#[test]
+fn test_length_of_array_function_parameter() {
+    // gawk: length(a) on an array passed by reference into a function
+    // returns the caller's element count, not 0.
+    let output = run_awk(
+        r#"function count(a) { return length(a) }
+        BEGIN { arr[1]=1; arr[2]=2; arr[3]=3; print count(arr) }"#,
+        "",
+    )
+    .unwrap();
+    assert_eq!(output, "3\n");
 }

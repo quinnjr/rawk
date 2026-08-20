@@ -2,9 +2,22 @@ use std::io::Write;
 
 use crate::ast::*;
 use crate::error::Result;
-use crate::value::{Value, compare_values};
+use crate::value::{Value, compare_values_with_format};
 
 use super::Interpreter;
+
+/// A `getline` target lvalue with its subscript / field-index expressions
+/// already evaluated (see `resolve_getline_target`).
+enum GetlineTarget {
+    /// Bare `getline`: store into $0 (updates NF).
+    Record,
+    Var(String),
+    /// Array name and the already-built subscript key.
+    Array(String, String),
+    Field(usize),
+    /// Unsupported lvalue shape; evaluate side effects, store nothing.
+    Discard,
+}
 
 impl<'a> Interpreter<'a> {
     /// Evaluate an expression (for contexts where we don't have output, like condition checking)
@@ -23,7 +36,10 @@ impl<'a> Interpreter<'a> {
         match expr {
             Expr::Number(n, _) => Ok(Value::Number(*n)),
 
-            Expr::String(s, _) => Ok(Value::from_string(s.clone())),
+            // String literals are pure strings, never strnums: only values from
+            // input (fields, getline, FS splits) and the environment/ARGV get
+            // numeric-string comparison semantics (POSIX / gawk).
+            Expr::String(s, _) => Ok(Value::String(s.clone())),
 
             Expr::Regex(pattern, _) => {
                 // Regex in expression context matches against $0
@@ -136,19 +152,11 @@ impl<'a> Interpreter<'a> {
                 Ok(Value::Number(if result { 1.0 } else { 0.0 }))
             }
 
-            Expr::Concat(parts, _) => {
-                let mut result = String::new();
-                for part in parts {
-                    result.push_str(&self.eval_expr_with_output(part, output)?.to_string_val());
-                }
-                Ok(Value::from_string(result))
-            }
-
             Expr::Getline {
                 var,
                 input,
                 location,
-            } => self.eval_getline(var.as_ref(), input.as_ref(), *location),
+            } => self.eval_getline(var.as_deref(), input.as_ref(), *location),
 
             Expr::Group(expr, _) => self.eval_expr_with_output(expr, output),
         }
@@ -206,39 +214,51 @@ impl<'a> Interpreter<'a> {
                 }
             }
             BinaryOp::Pow => Ok(Value::Number(l.to_number().powf(r.to_number()))),
-            BinaryOp::Lt => Ok(Value::Number(if compare_values(&l, &r).is_lt() {
-                1.0
-            } else {
-                0.0
-            })),
-            BinaryOp::Le => Ok(Value::Number(if compare_values(&l, &r).is_le() {
-                1.0
-            } else {
-                0.0
-            })),
-            BinaryOp::Gt => Ok(Value::Number(if compare_values(&l, &r).is_gt() {
-                1.0
-            } else {
-                0.0
-            })),
-            BinaryOp::Ge => Ok(Value::Number(if compare_values(&l, &r).is_ge() {
-                1.0
-            } else {
-                0.0
-            })),
-            BinaryOp::Eq => Ok(Value::Number(if compare_values(&l, &r).is_eq() {
-                1.0
-            } else {
-                0.0
-            })),
-            BinaryOp::Ne => Ok(Value::Number(if compare_values(&l, &r).is_ne() {
-                1.0
-            } else {
-                0.0
-            })),
+            BinaryOp::Lt => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_lt() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
+            BinaryOp::Le => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_le() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
+            BinaryOp::Gt => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_gt() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
+            BinaryOp::Ge => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_ge() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
+            BinaryOp::Eq => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_eq() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
+            BinaryOp::Ne => Ok(Value::Number(
+                if compare_values_with_format(&l, &r, &self.convfmt).is_ne() {
+                    1.0
+                } else {
+                    0.0
+                },
+            )),
             BinaryOp::Concat => {
-                let mut s = l.to_string_val();
-                s.push_str(&r.to_string_val());
+                let mut s = self.to_conv_str(&l);
+                s.push_str(&self.to_conv_str(&r));
                 Ok(Value::from_string(s))
             }
             BinaryOp::And | BinaryOp::Or => unreachable!(), // Handled above
@@ -287,10 +307,48 @@ impl<'a> Interpreter<'a> {
         Ok(new_value)
     }
 
+    /// Resolve a `getline` target lvalue before the read happens: gawk
+    /// evaluates the target's subscript / field-index expressions (including
+    /// their side effects, e.g. `a[++n]`) even when the read hits EOF, so the
+    /// resolution must not wait for a successful read.
+    fn resolve_getline_target(&mut self, var: Option<&Expr>) -> Result<GetlineTarget> {
+        match var {
+            None => Ok(GetlineTarget::Record),
+            Some(Expr::Var(name, _)) => Ok(GetlineTarget::Var(name.clone())),
+            Some(Expr::ArrayAccess { array, indices, .. }) => {
+                let key_parts: Result<Vec<Value>> =
+                    indices.iter().map(|e| self.eval_expr(e)).collect();
+                let key = self.make_array_key(&key_parts?);
+                Ok(GetlineTarget::Array(array.clone(), key))
+            }
+            Some(Expr::Field(index_expr, _)) => {
+                let index = self.eval_expr(index_expr)?.to_number() as usize;
+                Ok(GetlineTarget::Field(index))
+            }
+            // The parser only produces Var/ArrayAccess/Field targets; mirror
+            // assign_to_lvalue's tolerance of anything else.
+            Some(_) => Ok(GetlineTarget::Discard),
+        }
+    }
+
+    /// Store a record read by `getline` into its pre-resolved target, or into
+    /// $0 when the form has no target.
+    fn store_getline_target(&mut self, target: GetlineTarget, line: String) {
+        match target {
+            GetlineTarget::Record => self.set_record(&line),
+            GetlineTarget::Var(name) => self.set_variable_value(&name, Value::from_string(line)),
+            GetlineTarget::Array(array, key) => {
+                self.set_array_element(&array, &key, Value::from_string(line))
+            }
+            GetlineTarget::Field(index) => self.set_field(index, line),
+            GetlineTarget::Discard => {}
+        }
+    }
+
     /// Evaluate getline expression
     pub(crate) fn eval_getline(
         &mut self,
-        var: Option<&String>,
+        var: Option<&Expr>,
         input: Option<&GetlineInput>,
         _location: crate::error::SourceLocation,
     ) -> Result<Value> {
@@ -298,12 +356,24 @@ impl<'a> Interpreter<'a> {
 
         match input {
             None => {
-                // getline with no input source - read from current input
-                // This is handled by the main loop, so we return 0 (EOF) here
-                Ok(Value::Number(0.0))
+                // Plain `getline` / `getline var`: read the next record from the
+                // main input, sharing the main loop's reader position.
+                let target = self.resolve_getline_target(var)?;
+                match self.next_main_record()? {
+                    None => Ok(Value::Number(0.0)), // EOF
+                    Some(line) => {
+                        // POSIX: both forms advance NR and FNR; only the bare
+                        // form sets $0 (and therefore NF).
+                        self.nr += 1;
+                        self.fnr += 1;
+                        self.store_getline_target(target, line);
+                        Ok(Value::Number(1.0))
+                    }
+                }
             }
             Some(GetlineInput::File(file_expr)) => {
                 let filename = self.eval_expr(file_expr)?.to_string_val();
+                let target = self.resolve_getline_target(var)?;
 
                 // Get or open the file
                 if !self.input_files.contains_key(&filename) {
@@ -329,11 +399,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
 
-                        if let Some(var_name) = var {
-                            self.set_variable_value(var_name, Value::from_string(line));
-                        } else {
-                            self.set_record(&line);
-                        }
+                        self.store_getline_target(target, line);
                         Ok(Value::Number(1.0)) // Success
                     }
                     Err(_) => Ok(Value::Number(-1.0)), // Error
@@ -341,6 +407,7 @@ impl<'a> Interpreter<'a> {
             }
             Some(GetlineInput::Pipe(cmd_expr)) => {
                 let cmd = self.eval_expr(cmd_expr)?.to_string_val();
+                let target = self.resolve_getline_target(var)?;
 
                 // Get or open the pipe
                 if !self.pipes.contains_key(&cmd) {
@@ -377,11 +444,7 @@ impl<'a> Interpreter<'a> {
                             }
                         }
 
-                        if let Some(var_name) = var {
-                            self.set_variable_value(var_name, Value::from_string(line));
-                        } else {
-                            self.set_record(&line);
-                        }
+                        self.store_getline_target(target, line);
                         Ok(Value::Number(1.0)) // Success
                     }
                     Err(_) => Ok(Value::Number(-1.0)), // Error

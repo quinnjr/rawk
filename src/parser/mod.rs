@@ -730,6 +730,40 @@ impl Parser {
         Ok(expr)
     }
 
+    /// Parses the optional target lvalue of a `getline`.
+    ///
+    /// POSIX allows the target to be any lvalue: a plain variable, an array
+    /// element (`getline a[i]`), or a field (`getline $1`). Returns `None`
+    /// when no target follows, in which case the record ($0) is set instead.
+    fn parse_getline_target(&mut self) -> Result<Option<Box<Expr>>> {
+        let location = self.current_location();
+
+        if self.check(&TokenKind::Dollar) {
+            return Ok(Some(Box::new(self.parse_field()?)));
+        }
+
+        let Some(TokenKind::Identifier(name)) = self.peek_kind() else {
+            return Ok(None);
+        };
+        let name = name.clone();
+        self.advance();
+
+        if self.match_token(&TokenKind::LeftBracket) {
+            let mut indices = vec![self.parse_expression()?];
+            while self.match_token(&TokenKind::Comma) {
+                indices.push(self.parse_expression()?);
+            }
+            self.expect(&TokenKind::RightBracket)?;
+            return Ok(Some(Box::new(Expr::ArrayAccess {
+                array: name,
+                indices,
+                location,
+            })));
+        }
+
+        Ok(Some(Box::new(Expr::Var(name, location))))
+    }
+
     /// Handle `cmd | getline [var]` syntax
     fn parse_pipe_getline(&mut self) -> Result<Expr> {
         let expr = self.parse_match()?;
@@ -744,14 +778,8 @@ impl Parser {
                 let location = self.current_location();
                 self.advance(); // consume getline
 
-                // Optional variable name
-                let var = if let Some(TokenKind::Identifier(name)) = self.peek_kind() {
-                    let name = name.clone();
-                    self.advance();
-                    Some(name)
-                } else {
-                    None
-                };
+                // Optional target lvalue
+                let var = self.parse_getline_target()?;
 
                 return Ok(Expr::Getline {
                     var,
@@ -1018,11 +1046,63 @@ impl Parser {
     fn parse_field(&mut self) -> Result<Expr> {
         if self.match_token(&TokenKind::Dollar) {
             let location = self.current_location();
-            let expr = self.parse_field()?;
+            let expr = self.parse_field_operand()?;
             return Ok(Expr::Field(Box::new(expr), location));
         }
 
         self.parse_primary()
+    }
+
+    /// Parses the operand of a `$` field reference.
+    ///
+    /// POSIX AWK grammar has `$` apply to a `unary_expr`, so field
+    /// references like `$-1`, `$+x`, `$++i`, `$--i`, and `$!x` are valid.
+    /// This mirrors `parse_unary`'s prefix operators but bottoms out in
+    /// `parse_field` (rather than `parse_postfix`) so that a nested `$`
+    /// (e.g. `$$1`) is still handled, and so that precedence for
+    /// everything else (postfix `++`/`--`, binary operators, `^`) is
+    /// unaffected: those are applied by the callers of `parse_field`.
+    fn parse_field_operand(&mut self) -> Result<Expr> {
+        let location = self.current_location();
+
+        if self.match_token(&TokenKind::Not) {
+            let operand = self.parse_field_operand()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                operand: Box::new(operand),
+                location,
+            });
+        }
+
+        if self.match_token(&TokenKind::Minus) {
+            let operand = self.parse_field_operand()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Neg,
+                operand: Box::new(operand),
+                location,
+            });
+        }
+
+        if self.match_token(&TokenKind::Plus) {
+            let operand = self.parse_field_operand()?;
+            return Ok(Expr::Unary {
+                op: UnaryOp::Pos,
+                operand: Box::new(operand),
+                location,
+            });
+        }
+
+        if self.match_token(&TokenKind::Increment) {
+            let operand = self.parse_field_operand()?;
+            return Ok(Expr::PreIncrement(Box::new(operand), location));
+        }
+
+        if self.match_token(&TokenKind::Decrement) {
+            let operand = self.parse_field_operand()?;
+            return Ok(Expr::PreDecrement(Box::new(operand), location));
+        }
+
+        self.parse_field()
     }
 
     fn parse_primary(&mut self) -> Result<Expr> {
@@ -1076,13 +1156,7 @@ impl Parser {
 
         // Getline
         if self.match_token(&TokenKind::Getline) {
-            let var = if let Some(TokenKind::Identifier(name)) = self.peek_kind() {
-                let name = name.clone();
-                self.advance();
-                Some(name)
-            } else {
-                None
-            };
+            let var = self.parse_getline_target()?;
 
             let input = if self.match_token(&TokenKind::Less) {
                 Some(GetlineInput::File(Box::new(self.parse_primary()?)))
@@ -1378,6 +1452,57 @@ mod tests {
     #[test]
     fn test_field_access() {
         let program = parse(r#"{ print $1, $NF, $(2+1) }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_field_unary_operand() {
+        // POSIX: `$` applies to a unary_expr, so `$-1`, `$+x`, `$!x` are
+        // valid field references (equivalent to `$(-1)`, `$(+x)`, `$(!x)`).
+        let program = parse(r#"{ print $-1 }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+
+        let program = parse(r#"{ print $+x }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+
+        let program = parse(r#"{ print $!x }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_field_pre_increment_operand() {
+        // `$++i` and `$--i` are valid field references: `$(++i)`.
+        let program = parse(r#"{ print $++i }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+
+        let program = parse(r#"{ print $--i }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_nested_field_dollar() {
+        // `$$1` is `$($1)`, not affected by the unary-operand extension.
+        let program = parse(r#"{ print $$1 }"#).unwrap();
+        assert_eq!(program.rules.len(), 1);
+    }
+
+    #[test]
+    fn test_field_post_increment_precedence() {
+        // `$1++` must remain `($1)++`, not `$(1++)`.
+        let program = parse(r#"{ $1++ }"#).unwrap();
+        let stmt = &program.rules[0].action.as_ref().unwrap().statements[0];
+        match stmt {
+            Stmt::Expr(Expr::PostIncrement(inner, _)) => {
+                assert!(matches!(**inner, Expr::Field(_, _)));
+            }
+            other => panic!("expected PostIncrement(Field(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_field_binary_precedence() {
+        // `$a+b` must remain `($a)+b`, not `$(a+b)`.
+        let program = parse(r#"{ x = $a + b }"#).unwrap();
         assert_eq!(program.rules.len(), 1);
     }
 
